@@ -32,11 +32,11 @@ mutable struct FunnelSolution
     Xprop::Any
     Uprop::Any
     function FunnelSolution(N::Int64,ix::Int64,iu::Int64,is::Int64)
-        iq = ix*ix
+        iq = div(ix*(ix+1),2)
         iX = iq
         X = zeros(iX,N+1)
         ik = ix*iu
-        iz = ix*ix
+        iz = iq
         iU = ik+iz+is
         U = zeros(iU,N+1)
 
@@ -107,6 +107,7 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
     N = fs.N
     ix = fs.dynamics.ix
     iu = fs.dynamics.iu
+    iq = fs.funl_dynamics.iq
     is = fs.funl_dynamics.is
     iphi = fs.dynamics.iϕ
     G = fs.dynamics.G
@@ -134,10 +135,8 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
         push!(Qcvx, @variable(model, [1:ix, 1:ix], PSD))
         push!(Kcvx, @variable(model, [1:iu, 1:ix]))
         push!(Zcvx, @variable(model, [1:ix, 1:ix], PSD))
-        if i <= N
-            push!(VC, @variable(model, [1:ix, 1:ix], Symmetric))
-        end
     end
+    @variable(model, VC[1:iq,1:N])
     @variable(model, vc_t[1:N])
     @variable(model, Scvx[1:is,1:N+1])
 
@@ -153,16 +152,13 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
     Kbar_scaled = zeros(iu,ix,N+1)
     Zbar_scaled = zeros(ix,ix,N+1)
     Sbar_scaled = zeros(is,N+1)
+    Qbar,Kbar,Zbar,Sbar = XU_to_QKZS(fs.solution.X,fs.solution.U,ix,iu)
 
     for i in 1:N+1
-        Q_ = reshape(fs.solution.X[1:ix*ix,i],(ix,ix))
-        K_ = reshape(fs.solution.U[1:iu*ix,i],(iu,ix))
-        Z_ = reshape(fs.solution.U[iu*ix+1:iu*ix+ix*ix,i],(ix,ix))
-
-        Qbar_scaled[:,:,i] .= iSx*Q_*iSx
-        Kbar_scaled[:,:,i] .= iSu*K_*iSx
-        Zbar_scaled[:,:,i] .= iSx*Z_*iSx
-        Sbar_scaled[:,i] .= fs.solution.U[end-is+1:end,i]
+        Qbar_scaled[:,:,i] .= iSx*Qbar[:,:,i]*iSx
+        Kbar_scaled[:,:,i] .= iSu*Kbar[:,:,i]*iSx
+        Zbar_scaled[:,:,i] .= iSx*Zbar[:,:,i]*iSx
+        Sbar_scaled[:,i] .= Sbar[:,i]
     end
 
     # boundary condition
@@ -189,15 +185,22 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
         # Funnel dynamics
         if i <= N
             dti = dtnom[i]
-            Ui = vcat(vec(Ki),vec(Zi),Si)
-            Uip = vcat(vec(Kip),vec(Zip),Sip)
-            @constraint(model, vec(Qip) == (
-                fs.solution.A[:,:,i]*vec(Qi) 
+            Ui = vcat(vec(Ki),vec_upper(Zi,ix),Si)
+            Uip = vcat(vec(Kip),vec_upper(Zip,ix),Sip)
+            # print_jl(fs.solution.A)
+            # print_jl(vec_upper(Qip,ix))
+            # print_jl(fs.solution.Bm)
+            # print_jl(fs.solution.Bp)
+            # print_jl(Ui)
+            # print_jl(Uip)
+            # print_jl(fs.solution.rem)
+            @constraint(model, vec_upper(Qip,ix) == (
+                fs.solution.A[:,:,i]*vec_upper(Qi,ix) 
                 + fs.solution.Bm[:,:,i]*Ui
                 + fs.solution.Bp[:,:,i]*Uip
                 + fs.solution.Bt[:,i].*dti # * S_sigma
                 + fs.solution.rem[:,i]
-                + vec(VC[i])
+                + VC[:,i]
             ))
         end
 
@@ -208,9 +211,8 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
         @constraint(model, LMI <= 0, PSDCone())
 
         # constraints
-        Qbar = reshape(fs.solution.X[1:ix*ix,i],(ix,ix))
-        Kbar = reshape(fs.solution.U[1:iu*ix,i],(iu,ix))
-        state_input_constraints!(fs,model::Model,Qi,Ki,Qbar,Kbar,xnom[:,i],unom[:,i],i)
+        state_input_constraints!(fs,model::Model,Qi,Ki,
+            Qbar[:,:,i],Kbar[:,:,i],xnom[:,i],unom[:,i],i)
     end
 
     # cost
@@ -221,18 +223,18 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
 
     # virtual control
     for i in 1:N
-        @constraint(model, [vc_t[i]; vec(VC[i])] in MOI.NormOneCone(1 + ix*ix))
+        @constraint(model, [vc_t[i]; VC[:,i]] in MOI.NormOneCone(1 + iq))
     end
     cost_vc = sum([vc_t[i] for i in 1:N])
 
     # trust region
     cost_tr = 0.0
     for i in 1:N+1
-        Qdiff = vec(Qcvx[i]-Qbar_scaled[:,:,i]) 
+        Qdiff = vec_upper(Qcvx[i]-Qbar_scaled[:,:,i],ix) 
         cost_tr += dot(Qdiff,Qdiff)
         Kdiff = vec(Kcvx[i]-Kbar_scaled[:,:,i]) 
         cost_tr += dot(Kdiff,Kdiff)
-        Zdiff = vec(Zcvx[i]-Zbar_scaled[:,:,i]) 
+        Zdiff = vec_upper(Zcvx[i]-Zbar_scaled[:,:,i],ix) 
         cost_tr += dot(Zdiff,Zdiff)
         Sdiff = Scvx[:,i]-Sbar_scaled[:,i]
         cost_tr += dot(Sdiff,Sdiff)
@@ -242,15 +244,15 @@ function sdpopt!(fs::FunnelSynthesis,xnom::Matrix,unom::Matrix,dtnom::Vector,Lip
     @objective(model,Min,cost_all)
     optimize!(model)
     time_solver_time = solve_time(model)
-    println("The elapsed time of solver is: $time_solver_time seconds")
+    # println("The elapsed time of solver is: $time_solver_time seconds")
 
     for i in 1:N+1
         Q = Sx*value.(Qcvx[i])*Sx
         K = Su*value.(Kcvx[i])*Sx
         Z = Sx*value.(Zcvx[i])*Sx
         S = value.(Scvx[:,i])
-        fs.solution.X[:,i] .= vec(Q)
-        fs.solution.U[:,i] .= vcat(vec(K),vec(Z),S)
+        fs.solution.X[:,i] .= vec_upper(Q,ix)
+        fs.solution.U[:,i] .= vcat(vec(K),vec_upper(Z,ix),S)
     end
 
     return value(cost_all),value(cost_funl),value(cost_vc),value(cost_tr)
@@ -270,13 +272,13 @@ function run(fs::FunnelSynthesis,X0::Matrix{Float64},U0::Matrix{Float64},Lipschi
             fs.solution.A,fs.solution.Bm,fs.solution.Bp,fs.solution.Bt,fs.solution.rem,_,_ = discretize_foh(fs.funl_dynamics,
                 fs.dynamics,xnom[:,1:N],unom,dtnom,fs.solution.X[:,1:N],fs.solution.U)
         end
-        println("The elapsed time of discretization is: $time_discretization seconds")
+        # println("The elapsed time of discretization is: $time_discretization seconds")
 
         # solve subproblem
         time_cvxopt = @elapsed begin
         c_all, c_funl, c_vc, c_tr = sdpopt!(fs,xnom,unom,dtnom,Lipschitz,solver,iteration)
         end
-        println("The elapsed time of subproblem is: $time_cvxopt seconds")
+        # println("The elapsed time of subproblem is: $time_cvxopt seconds")
 
         # propagate
         time_multiple_shooting = @elapsed begin
@@ -287,7 +289,7 @@ function run(fs::FunnelSynthesis,X0::Matrix{Float64},U0::Matrix{Float64},Lipschi
         ) =  propagate_multiple_FOH(fs.funl_dynamics,fs.dynamics,
             xnom,unom,dtnom,fs.solution.X,fs.solution.U,flag_single=false)
         end
-        println("The elapsed time of multiple shooting is: $time_multiple_shooting seconds")
+        # println("The elapsed time of multiple shooting is: $time_multiple_shooting seconds")
         dyn_error = maximum(norm.(eachcol(Xfwd - fs.solution.X), 2))
 
         if fs.verbosity == true && iteration == 1
@@ -299,7 +301,7 @@ function run(fs::FunnelSynthesis,X0::Matrix{Float64},U0::Matrix{Float64},Lipschi
         end
         @printf("|%-2d     |%-7.2f     |%-7.3f   |%-7.3f    |%-7.3f    |%-5.3f    |%-5.1f    | %-5.1f    |%-5.1e   |\n",
             iteration,
-            c_all,-1,c_funl,-1,
+            c_all,sum(dtnom),c_funl,-1,
             -1,
             log10(abs(c_vc)), log10(abs(c_tr)), log10(abs(dyn_error)))
 

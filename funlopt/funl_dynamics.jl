@@ -1,16 +1,12 @@
 include("../trajopt/dynamics.jl")
 include("../trajopt/discretize.jl")
+include("funl_utils.jl")
 
 using LinearAlgebra
 using BlockDiagonals
 using SparseArrays
 
 abstract type FunnelDynamics end
-
-function create_block_diagonal(right::Matrix, n::Int)
-    blocks = [right for _ in 1:n]
-    return BlockDiagonal(blocks)
-end
 
 function com_mat(m, n)
     A = reshape(1:m*n, n, m)  # Note the swapped dimensions for Julia
@@ -38,47 +34,80 @@ struct NonlinearDLMI <: FunnelDynamics
 
     Cn::Matrix # commutation matrix
     Cm::Matrix # commutation matrix
+    
+    i_upper::Vector
+    mask_upper::SparseMatrixCSC
     function NonlinearDLMI(alpha,ix,iu,C,D)
         Cn = com_mat(ix,ix)
         Cm = com_mat(iu,ix)
         is = 1
-        iX = ix*ix
-        iU = iu*ix+ix*ix+is
-        new(alpha,ix,iu,ix*ix,ix*iu,is,iX,iU,C,D,Cn,Cm)
+        iq = div((ix+1)*ix,2)
+        ik = iu*ix
+        iX = iq
+        iU = ik+iq+is # iq = iz
+        i_upper = get_index_for_upper(ix)
+
+        # Fill index map for mapping elements of q to elements of q_u
+        index_map = Dict()
+        k = 1
+        for j in 1:ix
+            for i in 1:j
+                index_map[(i, j)] = k
+                k += 1
+            end
+        end
+
+        # Create the derivative matrix
+        mask = zeros(ix^2, length(index_map))
+        for j in 1:ix
+            for i in 1:ix
+                # Use symmetry to find the index
+                idx = i <= j ? index_map[(i, j)] : index_map[(j, i)]
+                mask[(i-1)*ix + j, idx] = 1
+            end
+        end
+        new(alpha,ix,iu,iq,ik,is,iX,iU,C,D,Cn,Cm,i_upper,sparse(mask))
     end
 end
 
-function forward(model::NonlinearDLMI, X::Vector, U::Vector, A::Matrix, B::Matrix)
-    q = X[1:model.iq]
+function forward(model::NonlinearDLMI,X::Vector,U::Vector,A::Matrix,B::Matrix)
+    ix = model.ix
+
+    q_upper = X[1:model.iq]
     k = U[1:model.ik]
-    z = U[model.ik+1:model.ik+model.iq]
+    z_upper = U[model.ik+1:model.ik+model.iq]
     lam = U[model.ik+model.iq+1]
 
-    Q = reshape(q,(model.ix,model.ix))
+    # Q = reshape(q,(model.ix,model.ix))
+    Q = inv_vec_upper(q_upper,model.ix)
     K = reshape(k,(model.iu,model.ix))
-    Z = reshape(z,(model.ix,model.ix))
+    # Z = reshape(z,(model.ix,model.ix))
+    Z = inv_vec_upper(z_upper,model.ix)
 
    
     L = (A+B*K)*Q + 0.5*model.alpha*Q
     M = (model.C+model.D*K)*Q
     dQ = L + L' + lam*M'*M + Z
-    return vec(dQ)
+    return vec_upper(dQ,ix)
 end
 
 function diff(model::NonlinearDLMI,X::Vector,U::Vector,A::Matrix,B::Matrix)
     ix = model.ix
+    iu = model.iu
     iX = length(X)
     iU = length(U)
     is = model.is
+    i_upper = model.i_upper
+    mask_upper = model.mask_upper
 
-    q = X[1:model.iq]
+    q_upper = X[1:model.iq]
     k = U[1:model.ik]
-    z = U[model.ik+1:model.ik+model.iq]
+    z_upper = U[model.ik+1:model.ik+model.iq]
     lam = U[model.ik+model.iq+1]
 
-    Q = reshape(q,(model.ix,model.ix))
-    K = reshape(k,(model.iu,model.ix))
-    Z = reshape(z,(model.ix,model.ix))
+    Q = inv_vec_upper(q_upper,ix)
+    K = reshape(k,(iu,ix))
+    Z = inv_vec_upper(z_upper,ix)
 
     C_cl = model.C+model.D*K
 
@@ -86,34 +115,19 @@ function diff(model::NonlinearDLMI,X::Vector,U::Vector,A::Matrix,B::Matrix)
     Cn = sparse(model.Cn)
     Cm = sparse(model.Cm)
 
-    right = A + 0.5*model.alpha.*Imat
+    right = A + 0.5*model.alpha.*Imat + B*K + lam*Q'*C_cl'*C_cl
     kron_ = create_block_diagonal(right,ix)
     Aq = kron_ + Cn * kron_
+    Aq = Aq[i_upper,:] * mask_upper
 
-    right = B*K
-    kron_ = create_block_diagonal(right,ix)
-    Aq += kron(Imat, right) + Cn * kron_
-
-    right = lam*Q'*C_cl'*C_cl
-    kron_ = create_block_diagonal(right,ix)
-    Aq += kron(Imat, right) + Cn * kron_
-
-    kron_ = kron(Q',B)
-    FK = kron_ + Cn * kron_
-
-    right = lam*Q'*model.C'*model.D
+    right = B +lam*Q'*model.C'*model.D + lam*Q'*K'*model.D'*model.D
     kron_ = kron(Q',right)
-    FK += kron_ + Cn * kron_
+    FK = (kron_ + Cn * kron_)[i_upper,:]
 
-    right = lam*Q'*K'*model.D'*model.D
-    kron_ = kron(Q',right)
-    FK += kron_ + Cn * kron_
-
-    FZ = kron(Imat,Imat)
-    # Fz = Matrix(1.0I,ix*ix,ix*ix)
+    FZ = Matrix(1.0I,iX,iX)
 
     Flam = zeros(iX,is)
-    Flam[:,1] .= vec(Q'*C_cl'*C_cl*Q)
+    Flam[:,1] .= vec_upper(Q'*C_cl'*C_cl*Q,ix)
     # Flam[:,2] .= 
     # Sq = kron(Imat,Imat)
     return Aq,hcat(FK,FZ,Flam)
@@ -208,4 +222,210 @@ function discretize_foh(model::FunnelDynamics,dynamics::Dynamics,
         z[:,i] .= X_prop[:,i] - A[:,:,i]*X[:,i] - Bm[:,:,i]*Um - Bp[:,:,i]*Up - s[:,i] * dt
     end
     return A,Bm,Bp,s,z,x_prop,X_prop
+end
+
+function propagate_multiple_FOH(model::FunnelDynamics,dynamics::Dynamics,
+    x::Matrix,u::Matrix,T::Vector,
+    X::Matrix,U::Matrix;
+    flag_single::Bool=false)
+    N = size(x,2) - 1
+    ix = model.ix
+    iu = model.iu
+    iX = model.iX
+    iU = model.iU
+
+    idx_x = 1:ix
+    idx_X = (ix+1):(ix+iX)
+    function dvdt(out,V,p,t)
+        um = p[1]
+        up = p[2]
+        Um = p[3]
+        Up = p[4]
+        dt = p[5]
+
+        alpha = (dt - t) / dt
+        beta = t / dt
+
+        u_ = alpha * um + beta * up
+        U_ = alpha * Um + beta * Up
+
+        x_ = V[idx_x]
+        X_ = V[idx_X]
+
+        # traj terms
+        f = forward(dynamics,x_,u_)
+        fx,fu = diff(dynamics,x_,u_)
+
+        # funl terms
+        F = forward(model,X_,U_,fx,fu)
+
+        dV = [f;F]
+        out .= dV[:]
+    end
+
+    tprop = []
+    xprop = []
+    uprop = []
+    Xprop = []
+    Uprop = []
+    Xfwd = zeros(size(X))
+    Xfwd[:,1] .= X[:,1]
+    for i = 1:N
+        if flag_single == true
+            V0 = [x[:,i];Xfwd[:,i]][:]
+        else
+            V0 = [x[:,i];X[:,i]][:]
+        end
+
+        um = u[:,i]
+        up = u[:,i+1]
+        Um = U[:,i]
+        Up = U[:,i+1]
+        dt = T[i]
+
+        prob = ODEProblem(dvdt,V0,(0,dt),(um,up,Um,Up,dt))
+        sol = solve(prob, Tsit5(), reltol=1e-9, abstol=1e-9;verbose=false);
+
+        ode = stack(sol.u)
+        if i != N
+            tode = sol.t[1:end-1]
+            xode = ode[idx_x,1:end-1]
+            Xode = ode[idx_X,1:end-1]
+        else
+            tode = sol.t
+            xode = ode[idx_x,:]
+            Xode = ode[idx_X,:]
+        end
+        uode = zeros(iu,size(tode,1))
+        Uode = zeros(iU,size(tode,1))
+        for idx in 1:length(tode)
+            alpha = (dt - tode[idx]) / dt
+            beta = tode[idx] / dt
+            uode[:,idx] .= alpha * um + beta * up
+            Uode[:,idx] .= alpha * Um + beta * Up
+        end
+        if i == 1
+            tprop = tode
+            xprop = xode
+            uprop = uode
+            Xprop = Xode
+            Uprop = Uode
+        else 
+            tprop = vcat(tprop,sum(T[1:i-1]).+tode)
+            xprop = hcat(xprop,xode)
+            uprop = hcat(uprop,uode)
+            Xprop = hcat(Xprop,Xode)
+            Uprop = hcat(Uprop,Uode)
+        end
+        Xfwd[:,i+1] = ode[idx_X,end]
+    end
+    return Xfwd,tprop,xprop,uprop,Xprop,Uprop
+end
+
+function propagate_from_funnel_entry(x0::Vector,model::FunnelDynamics,dynamics::Dynamics,
+    xnom::Matrix,unom::Matrix,Tnom::Vector,
+    K::Array{Float64,3})
+    N = size(xnom,2) - 1
+    ix = model.ix
+    iu = model.iu
+
+    idx_x = 1:ix
+    idx_xnom = ix+1:2*ix
+    function dvdt(out,V,p,t)
+        um = p[1]
+        up = p[2]
+        km = p[3]
+        kp = p[4]
+        dt = p[5]
+
+        alpha = (dt - t) / dt
+        beta = t / dt
+
+        unom_ = alpha * um + beta * up
+        k_ = alpha * km + beta * kp
+        K_ = reshape(k_,(iu,ix))
+
+        x_ = V[idx_x]
+        xnom_ = V[idx_xnom]
+
+        u_ = unom_ + K_ * (x_ - xnom_)
+
+        # traj terms
+        f = forward(dynamics,x_,u_)
+        fnom = forward(dynamics,xnom_,unom_)
+
+        dV = [f;fnom]
+        out .= dV[:]
+    end
+
+    xfwd = zeros(size(xnom))
+    xfwd[:,1] .= x0
+    tprop = []
+    xprop = []
+    xnom_prop = []
+    uprop = []
+    for i = 1:N
+        V0 = [xfwd[:,i];xnom[:,i]][:]
+        um = unom[:,i]
+        up = unom[:,i+1]
+        km = vec(K[:,:,i])
+        kp = vec(K[:,:,i+1])
+        dt = Tnom[i]
+
+        prob = ODEProblem(dvdt,V0,(0,dt),(um,up,km,kp,dt))
+        sol = solve(prob, Tsit5(), reltol=1e-12, abstol=1e-12;verbose=false);
+
+        ode = stack(sol.u)
+        if i != N
+            tode = sol.t[1:end-1]
+            xode = ode[idx_x,1:end-1]
+            xnomode = ode[idx_xnom,1:end-1]
+        else
+            tode = sol.t
+            xode = ode[idx_x,:]
+            xnomode = ode[idx_xnom,:]
+        end
+        uode = zeros(iu,size(tode,1))
+        for idx in 1:length(tode)
+            alpha = (dt - tode[idx]) / dt
+            beta = tode[idx] / dt
+
+            unom_ = alpha * um + beta * up
+            k_ = alpha * km + beta * kp
+            x_ = xode[:,idx]
+            xnom_ = xnomode[:,idx]
+            K_ = reshape(k_,(iu,ix))
+            uode[:,idx] .= unom_ + K_ * (x_ - xnom_)
+        end
+        if i == 1
+            tprop = tode
+            xprop = xode
+            xnom_prop = xnomode
+            uprop = uode
+        else 
+            tprop = vcat(tprop,sum(Tnom[1:i-1]).+tode)
+            xprop = hcat(xprop,xode)
+            xnom_prop = hcat(xnom_prop,xnomode)
+            uprop = hcat(uprop,uode)
+        end
+        xfwd[:,i+1] = ode[idx_x,end]
+    end
+    return xfwd,tprop,xprop,uprop,xnom_prop
+end
+
+function diff_numeric(model::FunnelDynamics,x::Vector,u::Vector,A::Matrix,B::Matrix)
+    ix = length(x)
+    iu = length(u)
+    eps_x = Diagonal{Float64}(I, ix)
+    eps_u = Diagonal{Float64}(I, iu)
+    fx = zeros(ix,ix)
+    fu = zeros(ix,iu)
+    h = 2^(-18)
+    for i in 1:ix
+        fx[:,i] = (forward(model,x+h*eps_x[:,i],u,A,B) - forward(model,x-h*eps_x[:,i],u,A,B)) / (2*h)
+    end
+    for i in 1:iu
+        fu[:,i] = (forward(model,x,u+h*eps_u[:,i],A,B) - forward(model,x,u-h*eps_u[:,i],A,B)) / (2*h)
+    end
+    return fx,fu
 end

@@ -123,9 +123,6 @@ end
 function final_condition!(dynamics::Dynamics,model::Model,xN::Vector,xf::Vector;uN::Vector)
     @constraint(model,xN == xf)
 end
-function final_condition!(dynamics::Rocket,model::Model,xN::Vector,xf::Vector;uN::Vector)
-    @constraint(model,xN[2:dynamics.ix] == xf[2:dynamics.ix])
-end
 
 struct ThreeDOFManipulatorConstraint <: Constraint
     tau_max::Float64
